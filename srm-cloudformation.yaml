@@ -1,0 +1,371 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+  RoleExecuteLambda:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ParamProjectName}-execute-lambda-${ParamENV}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: !Sub ${ParamProjectName}-invoke-lambda-${ParamENV}
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ "lambda:InvokeFunction",
+                "dynamodb:GetItem",
+                "dynamodb:PutItem",
+                "dynamodb:UpdateItem",
+                "dynamodb:DeleteItem"]
+                Resource: "*"
+
+  FunctionCheck:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ParamProjectName}-check-${ParamENV}
+      Runtime: go1.x
+      Timeout: 180
+      Handler: dist/check
+      CodeUri: dist/check.zip
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableSRM
+
+  MachineOfferAcceptance:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub ${ParamProjectName}-OfferAcceptance-${ParamENV}
+      DefinitionString: !Sub |-
+        {
+          "Comment": "Sky Reseller Migration State Machine - Offer Accepted (triggered through API Gateway)",
+          "StartAt": "SRMOfferAcceptProcess",
+          "States": {
+            "SRMOfferAcceptProcess": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-southeast-2:326225893580:function:SRMOfferAcceptProcess",
+            "Next": "SRMRecordAcceptedCustomer"
+          },
+        
+          "SRMRecordAcceptedCustomer": {
+            "Type": "Task",
+                "Resource": "arn:aws:states:::dynamodb:putItem",
+                "Parameters": {
+                  "TableName": "${ParamProjectName}-dynamo-${ParamENV}",
+                  "Item": {
+                    "PartyID": {"S.$": "$.data.customerUUID"},
+                    "Status": {"S": "requested"}
+                  }
+                },      
+            "Next": "SRMCreateBanner"
+          },
+        
+          "SRMCreateBanner": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-southeast-2:326225893580:function:SRMCreateBanner",
+            "Next": "SRMOfferAcepted24HoursDelayBypassOrStart"
+          },
+        
+            "SRMOfferAcepted24HoursDelayBypassOrStart": {
+            "Type": "Choice",
+            "Choices": [
+              {
+              "Variable": "$.data.bypass24HoursDelay",
+                    "Comment": "For some cases, this wait can be bypassed",
+              "NumericEquals": 1,
+              "Next": "SRMPollOfferStatus"
+              },
+              {
+              "Variable": "$.data.bypass24HoursDelay",
+              "NumericEquals": 1,
+              "Next": "SRMOfferAcepted24HoursLapsed"
+              }
+                ]
+        
+          },
+        
+          "SRMOfferAcepted24HoursLapsed": {
+                "Type": "Wait",
+                "Seconds": 86400,
+            "Next": "SRMPollOfferStatus"
+          },
+        
+              
+          "SRMPollOfferStatus": {
+            "Type": "Task",
+                "Resource": "arn:aws:states:::dynamodb:getItem",
+                "Parameters": {
+                  "TableName": "${ParamProjectName}-dynamo-${ParamENV}",
+                  "Key": {
+                    "MessageId": {"S.$": "$.data.customerUUID"}
+                  }
+                },      
+            "Next": "SRMOfferStatusCheck"
+          },
+              
+          "SRMOfferStatusCheck": {
+            "Type": "Choice",
+            "Choices": [
+              {
+              "Variable": "$.data.offerDeclined",
+                    "Comment": "Customer has declined the offer during this 24 hours, terminate this Acceptance state machine",
+              "NumericEquals": 1,
+              "Next": "SRMOfferAcceptedEnd"
+              },
+              {
+              "Variable": "$.data.selfInstall",
+              "NumericEquals": 1,
+              "Next": "SRMOfferAcceptedSelfInstall"
+              },
+              {
+              "Variable": "$.data.selfInstall",
+              "NumericEquals": 2,
+              "Next": "SRMOfferAcceptedManagedInstall"
+              }
+            ]
+          },
+        
+          "SRMOfferAcceptedManagedInstall": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-southeast-2:326225893580:function:SRMOfferAcceptedManagedInstall",
+            "Next": "SRMOfferAcceptedSelfInstall"  
+          },
+        
+          "SRMOfferAcceptedSelfInstall": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-southeast-2:326225893580:function:SRMOfferAcceptedSelfInstall",
+            "Next": "SRMOrderHardware"
+          },
+        
+          "SRMOrderHardware": {
+            "Type": "Task",
+                "Comment": "HW delivery status is updated inside vftv-migrationsvc",
+            "Resource": "arn:aws:lambda:ap-southeast-2:326225893580:function:SRMOrderHardware",
+            "Next": "SRMStopBillingComms"
+          },
+        
+          "SRMStopBillingComms": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-southeast-2:326225893580:function:SRMStopBillingComms",
+            "Next": "SRMRequestSkyDisconnect"
+          },
+        
+          "SRMRequestSkyDisconnect": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-southeast-2:326225893580:function:SRMRequestSkyDisconnect",
+            "Next": "SRMWaitForHwDelivery"
+          },
+        
+          "SRMWaitForHwDelivery": {
+            "Type": "Wait",
+                "Comment": "Wait 5 days for HW delivery",
+                "Seconds": 430000,
+            "Next": "SRMSetPlugInCheck"
+          },
+              
+          "SRMSetPlugInCheck": {
+            "Type": "Choice",
+            "Choices": [
+              {
+              "Variable": "$.data.setPlugIn",
+              "NumericEquals": 1,
+              "Next": "SRMOfferAcceptedEnd"
+              },
+              {
+              "Variable": "$.data.setPlugIn",
+              "NumericEquals": 2,
+              "Next": "SRMPlugInReminder"
+              }
+            ]
+          },
+        
+            "SRMPlugInReminder": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-southeast-2:326225893580:function:PlugInReminder",
+            "Next": "SRMDelayPlugin"
+          },
+        
+            "SRMDelayPlugin": {
+            "Type": "Wait",
+                "Seconds": 86400,
+            "Next": "SRMSetPlugInCheck"
+          },
+        
+        
+          "SRMOfferAcceptedEnd": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-southeast-2:326225893580:function:SRMOfferAcceptedEnd",
+            "End": true
+          }
+          }
+        }
+      RoleArn: !GetAtt RoleExecuteLambda.Arn
+
+  MachineOfferDecline:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub ${ParamProjectName}-OfferDecline-${ParamENV}
+      DefinitionString: !Sub |-
+        {
+          "Comment": "Sky Reseller Migration State Machine - Offer Decline (triggered through API Gateway)",
+          "StartAt": "SRMOfferDeclineProcess",
+          "States": {
+            "SRMOfferDeclineProcess": {
+            "Type": "Task",
+            "Resource": "${FunctionCheck.Arn}",
+            "Next": "SRMRecordCustomerDecline"
+          },
+        
+          "SRMRecordCustomerDecline": {
+            "Type": "Task",
+                "Comment": "Customer to fill in the decline form if any, eg. reason, etc",
+                "InputPath": "$",
+                "ResultPath": "$",
+                "OutputPath": "$",
+                "Resource": "arn:aws:states:::dynamodb:putItem",
+                "Parameters": {
+                  "TableName": "${ParamProjectName}-dynamo-${ParamENV}",
+                  "Item": {
+                    "CustomerUUID": {"S.$": "$.CustomerUUID"}
+                  }
+                },      
+            "Next": "SRMCreateBannerDecline"
+          },
+        
+          "SRMCreateBannerDecline": {
+            "Type": "Task",
+                "Comment": "Create banner in the admin portal",
+            "Resource": "${FunctionCheck.Arn}",
+            "Next": "SRMOfferDeclined"
+          },
+        
+            "SRMOfferDeclined": {
+            "Type": "Task",
+                "Comment": "OfferDecline form submitted",
+            "Resource": "${FunctionCheck.Arn}",
+            "Next": "SRMOfferDeclineComplete"
+          },
+        
+          "SRMOfferDeclineComplete": {
+            "Type": "Task",
+            "Resource": "${FunctionCheck.Arn}",
+            "End": true
+          }
+          }
+        }
+      RoleArn: !GetAtt RoleExecuteLambda.Arn
+
+  MachineVTVPlugin:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub ${ParamProjectName}-VTVPlugin-${ParamENV}
+      DefinitionString: !Sub |-
+
+        {
+          "Comment": "Sky Reseller Migration State Machine - VTV Plugin",
+          "StartAt": "SRMVTVPlugin",
+          "States": {
+            "SRMVTVPlugin": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-southeast-2:326225893580:function:SRMVTVPlugin",
+            "Next": "SRMActivateVTV"
+          },
+        
+          "SRMActivateVTV": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-southeast-2:326225893580:function:SRMActivateVTV",
+            "Next": "SRMStartCharging"
+          },
+        
+          "SRMStartCharging": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-southeast-2:326225893580:function:SRMStartCharging",
+            "Next": "SRMVTVPluginDelay"
+          },
+        
+          "SRMVTVPluginDelay": {
+            "Type": "Wait",
+                "Seconds": 86400,
+            "Next": "SRMPollSkyStatus"
+          },
+              
+          "SRMPollSkyStatus": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-southeast-2:326225893580:function:SRMPollSkyStatus",
+            "Next": "SRMCheckSkyStatus"
+          },
+        
+          "SRMCheckSkyStatus": {
+            "Type": "Choice",
+            "Choices": [
+              {
+              "Variable": "$.data.skyStatusOk",
+              "NumericEquals": 1,
+              "Next": "SRMVTVPluninComplete"
+              },
+              {
+              "Variable": "$.data.continueWait",
+              "Comment": "Continue wait for the sky status to be ok within less than 3 times?",
+              "NumericEquals": 1,
+              "Next": "SRMVTVPluginDelay"
+              },
+              {
+              "Variable": "$.data.skyStatusOk",
+              "NumericEquals": 2,
+              "Next": "SRMReportAbnormal"
+              }
+            ]
+          },
+              
+          "SRMReportAbnormal": {
+            "Type": "Task",
+            "Comment": "Sky status abnormal, require human involved, report to customer support",
+            "Resource": "arn:aws:lambda:ap-southeast-2:326225893580:function:ReportAbnormal",
+            "Next": "SRMVTVPluninComplete"
+          },
+              
+          "SRMVTVPluninComplete": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-southeast-2:326225893580:function:SRMVTVPluninComplete",
+            "End": true
+          }
+          }
+        }
+      RoleArn: !GetAtt RoleExecuteLambda.Arn
+
+
+  TableSRM:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ParamProjectName}-dynamo-${ParamENV}
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: CustomerUUID
+          KeyType: HASH
+      AttributeDefinitions:
+        - AttributeName: CustomerUUID
+          AttributeType: S
+
+Parameters:
+  ParamProjectScope:
+    Type: String
+    Default: vftv
+  ParamProjectName:
+    Type: String
+    Default: srm
+  ParamENV:
+    Type: String
+    Default: dev
+
+Outputs:
+  OfferAcceptance:
+    Description: ARN for OfferAcceptance State Machine
+    Value: !Ref MachineOfferAcceptance
