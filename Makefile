@@ -48,6 +48,7 @@ deploy:
 			ParamProjectID=$(PROJECT_ID) \
 			ParamProjectScope=$(PROJECT_SCOPE) \
 			ParamProjectName=$(PROJECT_NAME) \
+			ParamAPIBASE=$(PROJECT_API_BASE)
 			ParamENV=$(ENV)
 
 update:
@@ -75,7 +76,7 @@ build-%:
 	@ GOOS=linux go build -ldflags="-s -w" -o ./dist/$* ./src/$*
 
 build: clean
-build: build-check
+build: build-test
 
 all: build lambda package deploy
 
